@@ -69,7 +69,7 @@ class MyDataset(Dataset):
 
     def get_item_func(self, index: int):
         item = self.dataset.iloc[index]
-        return self.item_processor.process_item(item)
+        return self.item_processor.process_item(item, training_mode=True)
 
 
     def __getitem__(self, index):

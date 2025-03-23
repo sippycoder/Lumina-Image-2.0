@@ -135,7 +135,7 @@ class WorldModelItemProcessor(ItemProcessor):
         except Exception as e:
             logger.warning(f"Failed to download image from {media_path}: {e}")
             # Return a small black image as a fallback
-            return Image.new('RGB', (224, 224), color='black')
+            return Image.new('RGB', (360, 360), color='black')
     
     def process_item(self, data_item, training_mode=False):
         """
@@ -154,6 +154,10 @@ class WorldModelItemProcessor(ItemProcessor):
         for key in ['_id', 'source_id', 'width', 'height', 'caption', 'source']:
             if key in data_item:
                 result[key] = data_item[key]
+        
+        # Ensure caption exists and is not None
+        if 'caption' not in result or result['caption'] is None:
+            result['caption'] = ""  # Provide a default empty caption
         
         # Download and process the image
         try:
