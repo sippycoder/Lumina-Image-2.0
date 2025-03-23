@@ -6,6 +6,7 @@ from torch import nn
 from diffusers import AutoencoderKLHunyuanVideo
 import re
 from cosmos_tokenizer.video_lib import CausalVideoTokenizer
+from cosmos_tokenizer.image_lib import ImageTokenizer
 from cosmos_tokenizer.networks.configs import (
     discrete_video as discrete_video_dict,
 )
@@ -240,7 +241,7 @@ class COSMOSDiscreteVAE(BaseLatentVideoVAE):
         return self.decode(indices)
 
 
-class COSMOSContinuousVAE(BaseLatentVideoVAE):
+class COSMOSContinuousVideoVAE(BaseLatentVideoVAE):
     def __init__(self, args: LatentVideoVAEArgs):
         super().__init__(args)
         """
@@ -298,6 +299,66 @@ class COSMOSContinuousVAE(BaseLatentVideoVAE):
         return self.decode(x)
 
 
+class COSMOSContinuousImageVAE(BaseLatentVideoVAE):
+    def __init__(self, args: LatentVideoVAEArgs):
+        super().__init__(args)
+        """
+        Initialize the encoder and decoder for Continuous VAE.
+        Checks model type and returns the initialized VAE instance.
+        """
+        cfg = self.cfg
+        model_type = _assert_cosmos_model_type(cfg.pretrained_model_name_or_path, "CI")
+        logger.info(f"COSMOSContinuousVAE initialized with type: {model_type}")
+        self.vae = types.SimpleNamespace()
+        encoder_config = continuous_video_dict
+        encoder_config.update(dict(spatial_compression=16))
+        encoder_config.update(dict(temporal_compression=8))
+        self.vae = ImageTokenizer(
+            checkpoint_enc=f"{cfg.pretrained_model_name_or_path}/encoder.jit",
+            checkpoint_dec=f"{cfg.pretrained_model_name_or_path}/decoder.jit",
+            tokenizer_config=continuous_video_dict,
+            dtype=args.model_dtype,
+        )
+
+    @torch.no_grad()
+    def encode(self, frames_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Encodes the input frames into latent representations.
+
+        params:
+            frames_tensor: B x 3 x H x W, range [-1..1]
+        return:
+            latent: B x 16 x H/8 x W/8, range [-1..1]
+        """
+        dtype = next(self.vae.parameters()).dtype
+        frames_tensor = frames_tensor.to(dtype)
+        (latent,) = self.vae.encode(frames_tensor)
+        return latent
+
+    @torch.no_grad()
+    def decode(self, encoded_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Decodes the latent representations back into reconstructed frames.
+
+        params:
+            encoded_tensor: B x 16 x H/8 x W/8, range [-1..1]
+        return:
+            x: B x 3 x H x W, range [-1..1]
+        """
+        dtype = next(self.vae.parameters()).dtype
+        encoded_tensor = encoded_tensor.to(dtype)
+        x = self.vae.decode(encoded_tensor)
+        return x
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Full forward pass: encode and then decode.
+        """
+        x = self.encode(x)
+        return self.decode(x)
+
+
 # Registry to hold VAE classes
 VAE_REGISTRY: Dict[str, Type[BaseLatentVideoVAE]] = {}
 
@@ -338,6 +399,5 @@ def build_vae(args: LatentVideoVAEArgs, **kwargs) -> BaseLatentVideoVAE:
 # Register VAE classes
 register_vae("Hunyuan", HunyuanVideoVAE)
 register_vae("COSMOS-DV", COSMOSDiscreteVAE)
-register_vae("COSMOS-CV", COSMOSContinuousVAE)
-register_vae("COSMOS-DI", COSMOSDiscreteVAE)
-register_vae("COSMOS-CI", COSMOSContinuousVAE)
+register_vae("COSMOS-CV", COSMOSContinuousVideoVAE)
+register_vae("COSMOS-CI", COSMOSContinuousImageVAE)
