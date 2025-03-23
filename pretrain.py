@@ -47,6 +47,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import trange
 import wandb
 from torchvision import transforms
 from transformers import AutoModel, AutoTokenizer
@@ -517,6 +518,7 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=dataloader_collate_fn,
+            prefetch_factor=2,
         )
 
         # default: 1000 steps, linear noise schedule
@@ -548,7 +550,7 @@ def main(args):
 
     logger.info(f"Training for {args.max_steps:,} steps...")
 
-    for step in range(resume_step, args.max_steps):
+    for step in trange(resume_step, args.max_steps):
         start_time = time()
         for train_res, data_pack in data_collection.items():
             x, caps = next(data_pack["loader_iter"])
@@ -648,7 +650,7 @@ def main(args):
                 # Measure training speed:
                 torch.cuda.synchronize()
                 logger.info(
-                    f"Res{train_res}_{train_res//4}: (step{step + 1:07d}) "
+                    f"Res{train_res}: (step{step + 1:07d}) "
                     + f"lr{opt.param_groups[0]['lr']:.6f} "
                     + " ".join([f"{key}:{str(metrics[key])}" for key in sorted(metrics.keys())])
                 )
