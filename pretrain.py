@@ -237,8 +237,8 @@ def encode_prompt(prompt_batch, text_encoder, tokenizer, proportion_empty_prompt
         prompt_masks = text_inputs.attention_mask
 
         prompt_embeds = text_encoder(
-            input_ids=text_input_ids,
-            attention_mask=prompt_masks,
+            input_ids=text_input_ids.to(text_encoder.device),
+            attention_mask=prompt_masks.to(text_encoder.device),
             output_hidden_states=True,
         ).hidden_states[-2]
 
@@ -301,7 +301,7 @@ def main(args):
 
     # create tokenizers
     # Load the tokenizers
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b")
+    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder)
     tokenizer.padding_side = "right"
 
     # create text encoders
@@ -310,14 +310,13 @@ def main(args):
         text_encoder = AutoModel.from_pretrained(
             args.text_encoder,
             torch_dtype=torch.bfloat16,
-        )
+        ).cuda()
     else:
         text_encoder =  AutoLigerKernelForCausalLM.from_pretrained(
             args.text_encoder,
             torch_dtype=torch.bfloat16,
         )
-        text_encoder = text_encoder.model
-    text_encoder.cuda()
+        text_encoder = text_encoder.model.cuda()
 
     text_encoder = setup_lm_fsdp_sync(text_encoder)
     logger.info(f"text encoder: {type(text_encoder)}")
