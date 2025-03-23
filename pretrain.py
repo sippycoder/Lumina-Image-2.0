@@ -483,7 +483,7 @@ def main(args):
         logger.info(f"patch size: {patch_size}")
         max_num_patches = round((train_res / patch_size) ** 2)
         logger.info(f"Limiting number of patches to {max_num_patches}.")
-        crop_size_list = generate_crop_size_list(max_num_patches, patch_size)
+        crop_size_list = generate_crop_size_list(max_num_patches, patch_size, max_ratio=2.0)
         logger.info("List of crop sizes:")
         for i in range(0, len(crop_size_list), 6):
             logger.info(" " + "".join([f"{f'{w} x {h}':14s}" for w, h in crop_size_list[i : i + 6]]))

@@ -45,4 +45,5 @@ torchrun \
     --checkpointing \
     --text_encoder Qwen/Qwen2.5-VL-3B-Instruct \
     --use_wandb \
+    --no_auto_resume \
     2>&1 | tee -a /mnt/pollux/chandan/results/"$exp_name"/output.log

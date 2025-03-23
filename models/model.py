@@ -18,7 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .components import FeedForward, RMSNorm
+
+
+from .components import RMSNorm, DynamicTanh, LayerNorm, FeedForward
 
 
 def modulate(x, scale):
@@ -425,9 +427,8 @@ class FinalLayer(nn.Module):
 
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(
+        self.norm_final = LayerNorm(
             hidden_size,
-            elementwise_affine=False,
             eps=1e-6,
         )
         self.linear = nn.Linear(
@@ -500,6 +501,7 @@ class NextDiT(nn.Module):
         cap_feat_dim: int = 5120,
         axes_dims: List[int] = (16, 56, 56),
         axes_lens: List[int] = (1, 512, 512),
+        tie_adaLN: bool = False,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -560,6 +562,20 @@ class NextDiT(nn.Module):
         # nn.init.zeros_(self.cap_embedder[1].weight)
         nn.init.zeros_(self.cap_embedder[1].bias)
 
+        # Create a single shared adaLN_modulation module if tie_adaLN is True
+        shared_adaLN = None
+        if tie_adaLN:
+            shared_adaLN = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(
+                    min(dim, 1024),
+                    4 * dim,
+                    bias=True,
+                ),
+            )
+            nn.init.zeros_(shared_adaLN[1].weight)
+            nn.init.zeros_(shared_adaLN[1].bias)
+
         self.layers = nn.ModuleList(
             [
                 JointTransformerBlock(
@@ -575,6 +591,12 @@ class NextDiT(nn.Module):
                 for layer_id in range(n_layers)
             ]
         )
+        
+        # If tie_adaLN is True, use the shared adaLN for all layers
+        if tie_adaLN:
+            for layer in self.layers:
+                layer.adaLN_modulation = shared_adaLN
+                
         self.norm_final = RMSNorm(dim, eps=norm_eps)
         self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
 
@@ -805,17 +827,7 @@ class NextDiT(nn.Module):
         return freqs_cis
 
     def parameter_count(self) -> int:
-        total_params = 0
-
-        def _recursive_count_params(module):
-            nonlocal total_params
-            for param in module.parameters(recurse=False):
-                total_params += param.numel()
-            for submodule in module.children():
-                _recursive_count_params(submodule)
-
-        _recursive_count_params(self)
-        return total_params
+        return sum(p.numel() for p in self.parameters())
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)
@@ -837,8 +849,10 @@ def NextDiT_2B_GQA_patch2_Adaln_Refiner(**kwargs):
         n_kv_heads=8,
         axes_dims=[32, 32, 32],
         axes_lens=[300, 512, 512],
+        tie_adaLN=True,
         **kwargs
     )
+
 
 def NextDiT_3B_GQA_patch2_Adaln_Refiner(**kwargs):
     return NextDiT(
