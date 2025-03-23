@@ -241,7 +241,7 @@ class COSMOSDiscreteVAE(BaseLatentVideoVAE):
         return self.decode(indices)
 
 
-class COSMOSContinuousVideoVAE(BaseLatentVideoVAE):
+class COSMOSContinuousVideoAE(BaseLatentVideoVAE):
     def __init__(self, args: LatentVideoVAEArgs):
         super().__init__(args)
         """
@@ -258,7 +258,6 @@ class COSMOSContinuousVideoVAE(BaseLatentVideoVAE):
         self.vae = CausalVideoTokenizer(
             checkpoint_enc=f"{cfg.pretrained_model_name_or_path}/encoder.jit",
             checkpoint_dec=f"{cfg.pretrained_model_name_or_path}/decoder.jit",
-            tokenizer_config=continuous_video_dict,
             dtype=args.model_dtype,
         )
 
@@ -299,7 +298,7 @@ class COSMOSContinuousVideoVAE(BaseLatentVideoVAE):
         return self.decode(x)
 
 
-class COSMOSContinuousImageVAE(BaseLatentVideoVAE):
+class COSMOSContinuousImageAE(BaseLatentVideoVAE):
     def __init__(self, args: LatentVideoVAEArgs):
         super().__init__(args)
         """
@@ -310,13 +309,9 @@ class COSMOSContinuousImageVAE(BaseLatentVideoVAE):
         model_type = _assert_cosmos_model_type(cfg.pretrained_model_name_or_path, "CI")
         logger.info(f"COSMOSContinuousVAE initialized with type: {model_type}")
         self.vae = types.SimpleNamespace()
-        encoder_config = continuous_video_dict
-        encoder_config.update(dict(spatial_compression=16))
-        encoder_config.update(dict(temporal_compression=8))
         self.vae = ImageTokenizer(
             checkpoint_enc=f"{cfg.pretrained_model_name_or_path}/encoder.jit",
             checkpoint_dec=f"{cfg.pretrained_model_name_or_path}/decoder.jit",
-            tokenizer_config=continuous_video_dict,
             dtype=args.model_dtype,
         )
 
@@ -399,5 +394,5 @@ def build_vae(args: LatentVideoVAEArgs, **kwargs) -> BaseLatentVideoVAE:
 # Register VAE classes
 register_vae("Hunyuan", HunyuanVideoVAE)
 register_vae("COSMOS-DV", COSMOSDiscreteVAE)
-register_vae("COSMOS-CV", COSMOSContinuousVideoVAE)
-register_vae("COSMOS-CI", COSMOSContinuousImageVAE)
+register_vae("COSMOS-CV", COSMOSContinuousVideoAE)
+register_vae("COSMOS-CI", COSMOSContinuousImageAE)
