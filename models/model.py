@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .components import RMSNorm
+from .components import FeedForward, RMSNorm
 
 
 def modulate(x, scale):
@@ -159,7 +159,7 @@ class JointAttention(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor
                 and key tensor with rotary embeddings.
         """
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type="cuda", enabled=False):
             x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
             freqs_cis = freqs_cis.unsqueeze(2)
             x_out = torch.view_as_real(x * freqs_cis).flatten(3)
@@ -306,59 +306,6 @@ class JointAttention(nn.Module):
         output = output.flatten(-2)
 
         return self.out(output)
-
-
-class FeedForward(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        hidden_dim: int,
-        multiple_of: int,
-        ffn_dim_multiplier: Optional[float],
-    ):
-        """
-        Initialize the FeedForward module.
-
-        Args:
-            dim (int): Input dimension.
-            hidden_dim (int): Hidden dimension of the feedforward layer.
-            multiple_of (int): Value to ensure hidden dimension is a multiple
-                of this value.
-            ffn_dim_multiplier (float, optional): Custom multiplier for hidden
-                dimension. Defaults to None.
-
-        """
-        super().__init__()
-        # custom dim factor multiplier
-        if ffn_dim_multiplier is not None:
-            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-
-        self.w1 = nn.Linear(
-            dim,
-            hidden_dim,
-            bias=False,
-        )
-        nn.init.xavier_uniform_(self.w1.weight)
-        self.w2 = nn.Linear(
-            hidden_dim,
-            dim,
-            bias=False,
-        )
-        nn.init.xavier_uniform_(self.w2.weight)
-        self.w3 = nn.Linear(
-            dim,
-            hidden_dim,
-            bias=False,
-        )
-        nn.init.xavier_uniform_(self.w3.weight)
-
-    # @torch.compile
-    def _forward_silu_gating(self, x1, x3):
-        return F.silu(x1) * x3
-
-    def forward(self, x):
-        return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
 
 
 class JointTransformerBlock(nn.Module):
@@ -567,38 +514,38 @@ class NextDiT(nn.Module):
         nn.init.xavier_uniform_(self.x_embedder.weight)
         nn.init.constant_(self.x_embedder.bias, 0.0)
 
-        self.noise_refiner = nn.ModuleList(
-            [
-                JointTransformerBlock(
-                    layer_id,
-                    dim,
-                    n_heads,
-                    n_kv_heads,
-                    multiple_of,
-                    ffn_dim_multiplier,
-                    norm_eps,
-                    qk_norm,
-                    modulation=True,
-                )
-                for layer_id in range(n_refiner_layers)
-            ]
-        )
-        self.context_refiner = nn.ModuleList(
-            [
-                JointTransformerBlock(
-                    layer_id,
-                    dim,
-                    n_heads,
-                    n_kv_heads,
-                    multiple_of,
-                    ffn_dim_multiplier,
-                    norm_eps,
-                    qk_norm,
-                    modulation=False,
-                )
-                for layer_id in range(n_refiner_layers)
-            ]
-        )
+        # self.noise_refiner = nn.ModuleList(
+        #     [
+        #         JointTransformerBlock(
+        #             layer_id,
+        #             dim,
+        #             n_heads,
+        #             n_kv_heads,
+        #             multiple_of,
+        #             ffn_dim_multiplier,
+        #             norm_eps,
+        #             qk_norm,
+        #             modulation=True,
+        #         )
+        #         for layer_id in range(n_refiner_layers)
+        #     ]
+        # )
+        # self.context_refiner = nn.ModuleList(
+        #     [
+        #         JointTransformerBlock(
+        #             layer_id,
+        #             dim,
+        #             n_heads,
+        #             n_kv_heads,
+        #             multiple_of,
+        #             ffn_dim_multiplier,
+        #             norm_eps,
+        #             qk_norm,
+        #             modulation=False,
+        #         )
+        #         for layer_id in range(n_refiner_layers)
+        #     ]
+        # )
 
         self.t_embedder = TimestepEmbedder(min(dim, 1024))
         self.cap_embedder = nn.Sequential(
@@ -714,9 +661,9 @@ class NextDiT(nn.Module):
             cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
             img_freqs_cis[i, :img_len] = freqs_cis[i, cap_len:cap_len+img_len]
 
-        # refine context
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
+        # # refine context
+        # for layer in self.context_refiner:
+        #     cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
 
         # refine image
         flat_x = []
@@ -733,8 +680,8 @@ class NextDiT(nn.Module):
             padded_img_mask[i, :l_effective_img_len[i]] = True
 
         padded_img_embed = self.x_embedder(padded_img_embed)
-        for layer in self.noise_refiner:
-            padded_img_embed = layer(padded_img_embed, padded_img_mask, img_freqs_cis, t)
+        # for layer in self.noise_refiner:
+        #     padded_img_embed = layer(padded_img_embed, padded_img_mask, img_freqs_cis, t)
 
         mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
         padded_full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x[0].dtype)

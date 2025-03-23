@@ -2,53 +2,62 @@ import warnings
 
 import torch
 import torch.nn as nn
+from types import SimpleNamespace
 
-try:
-    from apex.normalization import FusedRMSNorm as RMSNorm
-except ImportError:
-    warnings.warn("Cannot import apex RMSNorm, switch to vanilla implementation")
+from liger_kernel.transformers import LigerRMSNorm
+from liger_kernel.transformers import LigerLayerNorm as LayerNorm
+from liger_kernel.transformers import LigerSwiGLUMLP
 
-    class RMSNorm(torch.nn.Module):
-        def __init__(self, dim: int, eps: float = 1e-6):
-            """
-            Initialize the RMSNorm normalization layer.
 
-            Args:
-                dim (int): The dimension of the input tensor.
-                eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
 
-            Attributes:
-                eps (float): A small value added to the denominator for numerical stability.
-                weight (nn.Parameter): Learnable scaling parameter.
+class FeedForward(LigerSwiGLUMLP):
+    def __init__(self,
+                 dim,
+                 hidden_dim,
+                 multiple_of,
+                 ffn_dim_multiplier,
+                 ):
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        config = SimpleNamespace(
+            hidden_size=dim,
+            intermediate_size=hidden_dim,
+            hidden_act="silu",
+        )
+        super().__init__(config)
 
-            """
-            super().__init__()
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(dim))
 
-        def _norm(self, x):
-            """
-            Apply the RMSNorm normalization to the input tensor.
+class RMSNorm(LigerRMSNorm):
+    def __init__(self,
+        hidden_size,
+        eps=1e-6,
+        offset=0.0,
+        casting_mode="llama",
+        init_fn="ones",
+        in_place=True,
+    ):
+        super().__init__(hidden_size=hidden_size, eps=eps, offset=offset, casting_mode=casting_mode, init_fn=init_fn, in_place=in_place)
+        self.hidden_size = hidden_size
 
-            Args:
-                x (torch.Tensor): The input tensor.
 
-            Returns:
-                torch.Tensor: The normalized tensor.
-
-            """
-            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-        def forward(self, x):
-            """
-            Forward pass through the RMSNorm layer.
-
-            Args:
-                x (torch.Tensor): The input tensor.
-
-            Returns:
-                torch.Tensor: The output tensor after applying RMSNorm.
-
-            """
-            output = self._norm(x.float()).type_as(x)
-            return output * self.weight
+class DynamicTanh(nn.Module):
+    def __init__(self, num_features, alpha_init_value=0.5):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+    
+    def forward(self, x):
+        x = torch.tanh(self.alpha * x)
+        return x * self.weight + self.bias
+    
+    @staticmethod
+    def convert_ln_to_dyt(module):
+        module_output = module
+        if isinstance(module, RMSNorm) or isinstance(module, LayerNorm):
+            module_output = DynamicTanh(module.hidden_size)
+        for name, child in module.named_children():
+            module_output.add_module(name, DynamicTanh.convert_ln_to_dyt(child))
+        del module
+        return module_output

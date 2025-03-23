@@ -9,10 +9,17 @@ from time import sleep
 import traceback
 import warnings
 
-import h5py
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pandas as pd
+from pymongo import MongoClient
+from tqdm import tqdm, trange
+from PIL import Image
 import torch.distributed as dist
 from torch.utils.data import Dataset
 import yaml
+
+from data.data_reader import ItemProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -33,170 +40,113 @@ class DataNoReportException(Exception):
         return f"{self.__class__}: {self.message}"
 
 
-class ItemProcessor(ABC):
-    @abstractmethod
-    def process_item(self, data_item, training_mode=False):
-        raise NotImplementedError
-
-
 class MyDataset(Dataset):
-    def __init__(self, config_path, item_processor: ItemProcessor, cache_on_disk=False):
+    def __init__(self, config_path, item_processor: ItemProcessor, use_cache=True):
         logger.info(f"read dataset config from {config_path}")
         with open(config_path, "r") as f:
             self.config = yaml.load(f, Loader=yaml.FullLoader)
         logger.info("DATASET CONFIG:")
         logger.info(self.config)
 
-        self.cache_on_disk = cache_on_disk
-        if self.cache_on_disk:
-            cache_dir = self._get_cache_dir(config_path)
-            if dist.get_rank() == 0:
-                self._collect_annotations_and_save_to_cache(cache_dir)
-            dist.barrier()
-            ann, group_indice_range = self._load_annotations_from_cache(cache_dir)
-        else:
-            cache_dir = None
-            ann, group_indice_range = self._collect_annotations()
+        self.MONGODB_URI = self.config["MONGODB_URI"]
+        self.DATA_HOME = Path(self.config["DATA_HOME"])
 
-        self.ann = ann
-        self.group_indices = {key: list(range(val[0], val[1])) for key, val in group_indice_range.items()}
+        self.dataset = None
+        for meta in self.config["META"]:
+            if self.dataset is None:
+                self.dataset = self.get_dataset(meta["collection"], use_cache=use_cache)
+            else:
+                self.dataset = pd.concat([self.dataset, self.get_dataset(meta["collection"], use_cache=use_cache)])
 
         logger.info(f"total length: {len(self)}")
 
         self.item_processor = item_processor
 
+
     def __len__(self):
-        return len(self.ann)
+        return len(self.dataset)
 
-    def _collect_annotations(self):
-        group_ann = {}
-        for meta in self.config["META"]:
-            meta_path, meta_type = meta["path"], meta.get("type", "default")
-            meta_ext = os.path.splitext(meta_path)[-1]
-            if meta_ext == ".json":
-                # with open(meta_path) as f:
-                #     meta_l = json.load(f)
-                with open(meta_path, 'r') as json_file:
-                    f = json_file.read()
-                    meta_l = json.loads(f) 
-            elif meta_ext == ".jsonl":
-                meta_l = []
-                with open(meta_path) as f:
-                    for i, line in enumerate(f):
-                        try:
-                            meta_l.append(json.loads(line))
-                        except json.decoder.JSONDecodeError as e:
-                            logger.error(f"Error decoding the following jsonl line ({i}):\n{line.rstrip()}")
-                            raise e
-            else:
-                raise NotImplementedError(
-                    f'Unknown meta file extension: "{meta_ext}". '
-                    f"Currently, .json, .jsonl are supported. "
-                    "If you are using a supported format, please set the file extension so that the proper parsing "
-                    "routine can be called."
-                )
-            logger.info(f"{meta_path}, type{meta_type}: len {len(meta_l)}")
-            if "ratio" in meta:
-                random.seed(0)
-                meta_l = random.sample(meta_l, int(len(meta_l) * meta["ratio"]))
-                logger.info(f"sample (ratio = {meta['ratio']}) {len(meta_l)} items")
-            if "root" in meta:
-                for item in meta_l:
-                    for path_key in ["path", "image_url", "image", "image_path"]:
-                        if path_key in item:
-                            item[path_key] = os.path.join(meta["root"], item[path_key])
-            if meta_type not in group_ann:
-                group_ann[meta_type] = []
-            group_ann[meta_type] += meta_l
 
-        ann = sum(list(group_ann.values()), start=[])
+    def get_item_func(self, index: int):
+        item = self.dataset.iloc[index]
+        return self.item_processor.process_item(item)
 
-        group_indice_range = {}
-        start_pos = 0
-        for meta_type, meta_l in group_ann.items():
-            group_indice_range[meta_type] = [start_pos, start_pos + len(meta_l)]
-            start_pos = start_pos + len(meta_l)
-
-        return ann, group_indice_range
-
-    def _collect_annotations_and_save_to_cache(self, cache_dir):
-        if (Path(cache_dir) / "data.h5").exists() and (Path(cache_dir) / "ready").exists():
-            # off-the-shelf annotation cache exists
-            warnings.warn(
-                f"Use existing h5 data cache: {Path(cache_dir)}\n"
-                f"Note: if the actual data defined by the data config has changed since your last run, "
-                f"please delete the cache manually and re-run this experiment, or the data actually used "
-                f"will not be updated"
-            )
-            return
-
-        Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        ann, group_indice_range = self._collect_annotations()
-
-        # when cache on disk, rank0 saves items to an h5 file
-        serialized_ann = [json.dumps(_) for _ in ann]
-        logger.info(f"start to build data cache to: {Path(cache_dir)}")
-        with h5py.File(Path(cache_dir) / "data.h5", "w") as file:
-            dt = h5py.vlen_dtype(str)
-            h5_ann = file.create_dataset("ann", (len(serialized_ann),), dtype=dt)
-            h5_ann[:] = serialized_ann
-            file.create_dataset("group_indice_range", data=json.dumps(group_indice_range))
-        with open(Path(cache_dir) / "ready", "w") as f:
-            f.write("ready")
-        logger.info(f"data cache built")
-
-    @staticmethod
-    def _get_cache_dir(config_path):
-        config_identifier = config_path
-        disallowed_chars = ["/", "\\", ".", "?", "!"]
-        for _ in disallowed_chars:
-            config_identifier = config_identifier.replace(_, "-")
-        cache_dir = f"./accessory_data_cache/{config_identifier}"
-        return cache_dir
-
-    @staticmethod
-    def _load_annotations_from_cache(cache_dir):
-        while not (Path(cache_dir) / "ready").exists():
-            # cache has not yet been completed by rank 0
-            assert dist.get_rank() != 0
-            sleep(1)
-        cache_file = h5py.File(Path(cache_dir) / "data.h5", "r")
-        annotations = cache_file["ann"]
-        group_indice_range = json.loads(cache_file["group_indice_range"].asstr()[()])
-        return annotations, group_indice_range
-
-    def get_item_func(self, index):
-        data_item = self.ann[index]
-        if self.cache_on_disk:
-            data_item = json.loads(data_item)
-        else:
-            data_item = copy.deepcopy(data_item)
-
-        return self.item_processor.process_item(data_item, training_mode=True)
 
     def __getitem__(self, index):
         try:
             return self.get_item_func(index)
         except Exception as e:
-            if isinstance(e, DataNoReportException):
-                pass
-            elif isinstance(e, DataBriefReportException):
-                logger.info(e)
-            else:
-                logger.info(
-                    f"Item {index} errored, annotation:\n"
-                    f"{self.ann[index]}\n"
-                    f"Error:\n"
-                    f"{traceback.format_exc()}"
-                )
-            for group_name, indices_this_group in self.group_indices.items():
-                if indices_this_group[0] <= index <= indices_this_group[-1]:
-                    if index == indices_this_group[0]:
-                        new_index = indices_this_group[-1]
-                    else:
-                        new_index = index - 1
-                    return self[new_index]
+            logger.info(
+                f"Item {index} errored, annotation:\n"
+                f"{self.dataset[index]}\n"
+                f"Error:\n"
+                f"{traceback.format_exc()}"
+            )
             raise RuntimeError
 
-    def groups(self):
-        return list(self.group_indices.values())
+
+    def get_dataset(self, collection, use_cache=True):
+        rank = dist.get_rank()
+        if use_cache and (self.DATA_HOME / "shuffled" / f'{collection}-rank-{rank}.parquet').exists():
+            print(f"Loading {collection} from cache")
+            return pd.read_parquet(self.DATA_HOME / "shuffled" / f'{collection}-rank-{rank}.parquet')
+        else:
+            if dist.get_rank() == 0:
+                print(f"Loading {collection} from MongoDB, this may take a while...")
+                query = {}
+                projection = {
+                    "_id": 1,
+                    "source_id": 1,
+                    "media_path": 1,
+                    "width": 1,
+                    "height": 1,
+                    "caption": 1,
+                    "source": 1,
+                }
+
+                client = MongoClient(self.MONGODB_URI)
+                db = client['world_model']
+                collection = db[collection]
+
+                cursor = collection.find(
+                    query,
+                    projection,
+                    batch_size=8192,
+                    no_cursor_timeout=True,
+                    max_time_ms=2400000,
+                )
+
+                dataset = []
+                for doc in tqdm(cursor):
+                    dataset.append(doc)
+
+                self.save_dataset(dataset, self.DATA_HOME / "shuffled" / f'{collection}-rank-{rank}.parquet')
+            dist.barrier()
+            return pd.read_parquet(self.DATA_HOME / "shuffled" / f'{collection}-rank-{rank}.parquet')
+
+
+    @staticmethod
+    def save_dataset(dataset, path):
+        # Assuming 'data' is your large list of dictionaries
+        batch_size = 10000
+        schema = None  # Will be inferred from the first batch
+
+        for i in trange(0, len(dataset), batch_size):
+            batch = dataset[i:i+batch_size]
+            df_batch = pd.DataFrame(batch)
+            df_batch['_id'] = df_batch['_id'].map(lambda x: str(x))
+            
+            # For the first batch, create the schema and ParquetWriter
+            if i == 0:
+                table = pa.Table.from_pandas(df_batch, preserve_index=False)
+                schema = table.schema
+                writer = pq.ParquetWriter(path, schema)
+                writer.write_table(table)
+            else:
+                table = pa.Table.from_pandas(df_batch, schema=schema, preserve_index=False)
+                writer.write_table(table)
+
+        # Close the writer when done
+        if 'writer' in locals():
+            writer.close()
+            print("Parquet file created successfully!")
